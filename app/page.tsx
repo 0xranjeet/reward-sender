@@ -4,8 +4,8 @@ import { FormEvent, useMemo, useState } from "react";
 import { ConnectButton } from "@rainbow-me/rainbowkit";
 import { getPublicClient } from "@wagmi/core";
 import { useAccount, useChainId, useConfig, useSwitchChain, useWalletClient } from "wagmi";
-import { Address, formatUnits, isAddress, parseUnits } from "viem";
-import { erc20Abi, ipRewardDistributorAbi } from "@/lib/abi";
+import { Address, formatUnits, isAddress, parseAbi, parseUnits } from "viem";
+import { erc20Abi } from "@/lib/abi";
 import { supportedChains } from "@/lib/wallet";
 
 type DashboardState = {
@@ -15,6 +15,8 @@ type DashboardState = {
   decimals: number;
   balance: string;
 };
+
+type DetectedContractKind = "unknown" | "distributor" | "token";
 
 const emptyState: DashboardState = {
   owner: "",
@@ -30,6 +32,7 @@ const chainNameById = Object.fromEntries(supportedChains.map((chain) => [chain.i
   number,
   string
 >;
+const defaultTokenGetter = "";
 
 export default function Home() {
   const { address, isConnected } = useAccount();
@@ -41,11 +44,13 @@ export default function Home() {
   const [contractAddress, setContractAddress] = useState("");
   const [dashboard, setDashboard] = useState<DashboardState>(emptyState);
   const [detectedChainId, setDetectedChainId] = useState<number | null>(null);
+  const [detectedContractKind, setDetectedContractKind] = useState<DetectedContractKind>("unknown");
+  const [tokenGetter, setTokenGetter] = useState(defaultTokenGetter);
   const [depositAmount, setDepositAmount] = useState("");
   const [rewardUser, setRewardUser] = useState("");
   const [rewardAmount, setRewardAmount] = useState("");
   const [status, setStatus] = useState(
-    "Connect your wallet, enter your contract address in the input field, and then load the contract to use the dashboard actions."
+    "Enter a distributor or token contract address to detect it. Connect your wallet only when you want to use write actions."
   );
   const [loading, setLoading] = useState(false);
 
@@ -56,7 +61,7 @@ export default function Home() {
 
   const isCorrectChain = detectedChainId !== null && chainId === detectedChainId;
   const detectedChainName = detectedChainId ? chainNameById[detectedChainId] ?? `Chain #${detectedChainId}` : "";
-  const connectedChainName = chainNameById[chainId] ?? `Chain #${chainId}`;
+  const isDistributor = detectedContractKind === "distributor";
 
   const formattedBalance = useMemo(() => {
     const amount = Number(dashboard.balance);
@@ -71,7 +76,7 @@ export default function Home() {
 
   async function loadDashboard() {
     if (!isAddress(contractAddress)) {
-      setStatus("Enter a valid distributor contract address.");
+      setStatus("Enter a valid contract or token address.");
       return;
     }
 
@@ -83,6 +88,7 @@ export default function Home() {
 
       if (!contractChainId) {
         setDetectedChainId(null);
+        setDetectedContractKind("unknown");
         setDashboard(emptyState);
         setStatus("No contract code was found for this address on the supported chains. Check the address or the target network.");
         return;
@@ -96,59 +102,108 @@ export default function Home() {
         return;
       }
 
-      const [owner, token, rawBalance] = await Promise.all([
-        contractClient.readContract({
-          address: distributorAddress,
-          abi: ipRewardDistributorAbi,
-          functionName: "owner"
-        }),
-        contractClient.readContract({
-          address: distributorAddress,
-          abi: ipRewardDistributorAbi,
-          functionName: "ipToken"
-        }),
-        contractClient.readContract({
-          address: distributorAddress,
-          abi: ipRewardDistributorAbi,
-          functionName: "contractBalance"
-        })
-      ]);
+      try {
+        const resolvedTokenGetter = await resolveTokenGetterName(contractClient, distributorAddress, tokenGetter);
+        const distributorAbi = {
+          owner: buildReadAbi("owner", "address"),
+          token: buildReadAbi(resolvedTokenGetter, "address"),
+          balance: buildReadAbi("contractBalance", "uint256")
+        };
 
-      const [symbol, decimals] = await Promise.all([
-        contractClient
-          .readContract({
-            address: token,
-            abi: erc20Abi,
-            functionName: "symbol"
+        const [owner, token, rawBalance] = await Promise.all([
+          contractClient.readContract({
+            address: distributorAddress,
+            abi: distributorAbi.owner,
+            functionName: "owner"
+          }),
+          contractClient.readContract({
+            address: distributorAddress,
+            abi: distributorAbi.token,
+            functionName: resolvedTokenGetter
+          }),
+          contractClient.readContract({
+            address: distributorAddress,
+            abi: distributorAbi.balance,
+            functionName: "contractBalance"
           })
-          .catch(() => "TOKEN"),
-        contractClient
-          .readContract({
-            address: token,
-            abi: erc20Abi,
-            functionName: "decimals"
-          })
-          .catch(() => 18)
-      ]);
+        ]);
 
-      setDashboard({
-        owner,
-        token,
-        symbol,
-        decimals,
-        balance: formatUnits(rawBalance, decimals)
-      });
+        const [symbol, decimals] = await Promise.all([
+          contractClient
+            .readContract({
+              address: token,
+              abi: erc20Abi,
+              functionName: "symbol"
+            })
+            .catch(() => "TOKEN"),
+          contractClient
+            .readContract({
+              address: token,
+              abi: erc20Abi,
+              functionName: "decimals"
+            })
+            .catch(() => 18)
+        ]);
 
-      if (isConnected && chainId !== contractChainId) {
-        setStatus(
-          `The contract was found on ${chainNameById[contractChainId] ?? `Chain #${contractChainId}`}, but your wallet is connected to ${
-            chainNameById[chainId] ?? `Chain #${chainId}`
-          }. Switch to the contract chain before sending rewards or depositing tokens.`
-        );
-      } else {
-        setStatus(`Contract synced on ${chainNameById[contractChainId] ?? `Chain #${contractChainId}`}.`);
+        setDetectedContractKind("distributor");
+        setDashboard({
+          owner,
+          token,
+          symbol,
+          decimals,
+          balance: formatUnits(rawBalance, decimals)
+        });
+
+        if (isConnected && chainId !== contractChainId) {
+          setStatus(
+            `The distributor contract was found on ${chainNameById[contractChainId] ?? `Chain #${contractChainId}`}, but your wallet is connected to ${
+              chainNameById[chainId] ?? `Chain #${chainId}`
+            }. Switch to the contract chain before sending rewards or depositing tokens.`
+          );
+        } else {
+          setStatus(
+            `Contract synced on ${chainNameById[contractChainId] ?? `Chain #${contractChainId}`}. Token getter used: ${resolvedTokenGetter}().`
+          );
+        }
+      } catch {
+        const [symbol, decimals] = await Promise.all([
+          contractClient
+            .readContract({
+              address: distributorAddress,
+              abi: erc20Abi,
+              functionName: "symbol"
+            })
+            .catch(() => null),
+          contractClient
+            .readContract({
+              address: distributorAddress,
+              abi: erc20Abi,
+              functionName: "decimals"
+            })
+            .catch(() => null)
+        ]);
+
+        if (symbol !== null && decimals !== null) {
+          setDetectedContractKind("token");
+          setDashboard({
+            owner: "",
+            token: distributorAddress,
+            symbol,
+            decimals,
+            balance: "0"
+          });
+
+          setStatus(
+            `ERC-20 token detected on ${chainNameById[contractChainId] ?? `Chain #${contractChainId}`}. This address is a token contract, so custom reward/distributor actions are disabled.`
+          );
+          return;
+        }
+
+        throw new Error("This address has contract code, but the selected getter names did not match this contract. Try entering the correct token getter and other method names.");
       }
     } catch (error) {
+      setDetectedContractKind("unknown");
+      setDashboard(emptyState);
       setStatus(readError(error));
     } finally {
       setLoading(false);
@@ -202,7 +257,7 @@ export default function Home() {
       const depositHash = await walletClient.writeContract({
         account: address,
         address: contractAddress as Address,
-        abi: ipRewardDistributorAbi,
+        abi: buildWriteAbi("deposit", ["uint256 amount"]),
         functionName: "deposit",
         args: [amount],
         chain: walletClient.chain
@@ -256,7 +311,7 @@ export default function Home() {
       const hash = await walletClient.writeContract({
         account: address,
         address: contractAddress as Address,
-        abi: ipRewardDistributorAbi,
+        abi: buildWriteAbi("sendReward", ["address user", "uint256 amount"]),
         functionName: "sendReward",
         args: [rewardUser as Address, amount],
         chain: walletClient.chain
@@ -334,7 +389,7 @@ export default function Home() {
               </div>
 
               <label className="field">
-                <span>Distributor contract address</span>
+                <span>Contract or token address</span>
                 <input
                   value={contractAddress}
                   onChange={(event) => setContractAddress(event.target.value)}
@@ -342,8 +397,19 @@ export default function Home() {
                 />
               </label>
 
+              <div className="details-grid">
+                <label className="field">
+                  <span>Token getter</span>
+                  <input
+                    value={tokenGetter}
+                    onChange={(event) => setTokenGetter(event.target.value.trim())}
+                    placeholder="Enter token getter name"
+                  />
+                </label>
+              </div>
+
               <div className="action-row">
-                <button className="secondary-button" onClick={loadDashboard} disabled={loading || !isConnected}>
+                <button className="secondary-button" onClick={loadDashboard} disabled={loading}>
                   Load Contract Data
                 </button>
 
@@ -393,13 +459,13 @@ export default function Home() {
                     <strong>{dashboard.owner || "Not loaded"}</strong>
                   </div>
                   <div className="stat-card">
-                    <span>Token contract address</span>
+                    <span>{isDistributor ? "Token contract address" : "Detected token address"}</span>
                     <strong>{dashboard.token || "Not loaded"}</strong>
                   </div>
                   <div className="stat-card accent">
-                    <span>Contract Balance</span>
+                    <span>{isDistributor ? "Contract Balance" : "Detected token"}</span>
                     <strong>
-                      {formattedBalance} {dashboard.symbol}
+                      {isDistributor ? `${formattedBalance} ${dashboard.symbol}` : dashboard.symbol}
                     </strong>
                   </div>
                 </div>
@@ -408,7 +474,13 @@ export default function Home() {
           </div>
 
           <div className={`owner-chip ${isOwner ? "owner-chip-live" : ""}`}>
-            {isOwner ? "Connected wallet is owner" : "Owner wallet required for write actions"}
+            {isDistributor
+              ? isOwner
+                ? "Connected wallet is owner"
+                : "Owner wallet required for write actions"
+              : detectedContractKind === "token"
+                ? "Token contract detected. Custom write actions need the right contract methods."
+                : "Load a contract to enable custom actions"}
           </div>
         </article>
 
@@ -431,7 +503,7 @@ export default function Home() {
             <button
               className="primary-button"
               type="submit"
-              disabled={loading || !isOwner || !dashboard.token || !depositAmount || !isCorrectChain}
+              disabled={loading || !isDistributor || !isOwner || !dashboard.token || !depositAmount || !isCorrectChain}
             >
               Deposit to Contract
             </button>
@@ -466,7 +538,7 @@ export default function Home() {
             <button
               className="primary-button"
               type="submit"
-              disabled={loading || !isOwner || !rewardUser || !rewardAmount || !isCorrectChain}
+              disabled={loading || !isDistributor || !isOwner || !rewardUser || !rewardAmount || !isCorrectChain}
             >
               Send Reward
             </button>
@@ -490,4 +562,59 @@ function readError(error: unknown) {
   }
 
   return "An unknown error occurred. Check the browser console for more details.";
+}
+
+function buildReadAbi(functionName: string, returnType: string) {
+  return parseAbi([`function ${functionName}() view returns (${returnType})`]);
+}
+
+function buildWriteAbi(functionName: string, args: string[]) {
+  return parseAbi([`function ${functionName}(${args.join(", ")})`]);
+}
+
+function isValidFunctionName(value: string) {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
+}
+
+async function tryReadAddressFunction(
+  client: ReturnType<typeof getPublicClient>,
+  address: Address,
+  functionName: string
+) {
+  if (!client || !isValidFunctionName(functionName)) {
+    return null;
+  }
+
+  try {
+    const result = await client.readContract({
+      address,
+      abi: buildReadAbi(functionName, "address"),
+      functionName
+    });
+
+    return isAddress(result) ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveTokenGetterName(
+  client: ReturnType<typeof getPublicClient>,
+  address: Address,
+  preferredName: string
+) {
+  const candidates = Array.from(
+    new Set([preferredName, "ipToken", "token", "rewardToken", "paymentToken", "asset", "stakingToken"].filter(Boolean))
+  );
+
+  for (const candidate of candidates) {
+    const tokenAddress = await tryReadAddressFunction(client, address, candidate);
+    if (tokenAddress) {
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    `Could not detect the token getter automatically. Enter the correct token getter name, for example token(), ipToken(), rewardToken(), or your custom name like tokenxyz().`
+  );
 }
