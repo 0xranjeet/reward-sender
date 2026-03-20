@@ -202,12 +202,12 @@ export default function Home() {
           });
 
           setStatus(
-            `ERC-20 token detected on ${chainNameById[contractChainId] ?? `Chain #${contractChainId}`}. This address is a token contract, so custom reward/distributor actions are disabled.`
+            `ERC-20 token detected on ${chainNameById[contractChainId] ?? `Chain #${contractChainId}`}. This address is a token contract so custom reward/distributor actions are disabled.`
           );
           return;
         }
 
-        throw new Error("This address has contract code, but the selected getter names did not match this contract. Try entering the correct token getter and other method names.");
+        throw new Error("This address has contract code but the selected getter names did not match this contract. Try entering the correct token getter and other method names.");
       }
     } catch (error) {
       setDetectedContractKind("unknown");
